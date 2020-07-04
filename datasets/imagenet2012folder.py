@@ -22,13 +22,17 @@ from __future__ import print_function
 
 import io
 import os
-import tarfile
+import re
 
 import tensorflow.compat.v2 as tf
 import tensorflow_datasets.public_api as tfds
 
 
 _DESCRIPTION = '''\
+In contrast to the canonical tensorflow datasets' Imagenet2012, this allows
+extracted folders as input if the TAR is not available or if the TAR is
+already mounted with ratarmount.
+
 ILSVRC 2012, aka ImageNet is an image dataset organized according to the
 WordNet hierarchy. Each meaningful concept in WordNet, possibly described by
 multiple words or word phrases, is called a "synonym set" or "synset". There are
@@ -94,17 +98,68 @@ CMYK_IMAGES = [
 PNG_IMAGES = ['n02105855_2933.JPEG']
 
 
-class Imagenet2012(tfds.core.GeneratorBasedBuilder):
+class Imagenet2012Folder(tfds.core.GeneratorBasedBuilder):
   """Imagenet 2012, aka ILSVRC 2012."""
 
   VERSION = tfds.core.Version(
-      '5.0.0', 'New split API (https://tensorflow.org/datasets/splits)')
+      '1.0.0', 'New split API (https://tensorflow.org/datasets/splits)')
 
   MANUAL_DOWNLOAD_INSTRUCTIONS = """\
-  manual_dir should contain two files: ILSVRC2012_img_train.tar and
-  ILSVRC2012_img_val.tar.
-  You need to register on http://www.image-net.org/download-images in order
-  to get the link to download the dataset.
+  Download the dataset from: https://www.kaggle.com/c/imagenet-object-localization-challenge/data
+  E.g. by using: kaggle competitions download -c imagenet-object-localization-challenge
+
+  What you get is a zip with this structure:
+    imagenet-object-localization-challenge.zip
+      LOC_sample_submission.csv
+      LOC_synset_mapping.txt
+      LOC_train_solution.csv
+      LOC_val_solution.csv
+      imagenet_object_localization_patched2019.tar.gz
+        ILSVRC
+          Annotations
+            CLS-LOC
+              val
+                ILSVRC2012_val_00025981.xml
+                ILSVRC2012_val_00048606.xml
+                ILSVRC2012_val_00025198.xml
+                ...
+              train
+                n02276258
+                  n02276258_3025.xml
+                  n02276258_7567.xml
+                  n02276258_4818.xml
+                  ...
+                n02412080
+                  n02412080_16229.xml
+                  n02412080_61170.xml
+                  ..
+                ..
+          ImageSets
+            CLS-LOC
+              val.txt
+              train_cls.txt
+              test.txt
+              train_loc.txt
+
+          Data
+            CLS-LOC
+              val
+                ILSVRC2012_val_00025981.JPEG
+                ILSVRC2012_val_00048606.JPEG
+                ILSVRC2012_val_00025198.JPEG
+                ...
+              train
+                n02276258
+                  n02276258_3025.JPEG
+                  n02276258_7567.JPEG
+                  n02276258_4818.JPEG
+                  ...
+                n02412080
+                  n02412080_16229.JPEG
+                  n02412080_61170.JPEG
+                  ..
+
+  In this case manual_dir should point to ILSVRC/Data/CLS-LOC containing the val and train subfolders.
   """
 
   def _info(self):
@@ -127,7 +182,7 @@ class Imagenet2012(tfds.core.GeneratorBasedBuilder):
     """Returns labels for validation.
 
     Args:
-      val_path: path to TAR file containing validation images. It is used to
+      val_path: path to folder containing validation images. It is used to
       retrieve the name of pictures and associate them to labels.
 
     Returns:
@@ -137,14 +192,12 @@ class Imagenet2012(tfds.core.GeneratorBasedBuilder):
     with tf.io.gfile.GFile(labels_path) as labels_f:
       # `splitlines` to remove trailing `\r` in Windows
       labels = labels_f.read().strip().splitlines()
-    with tf.io.gfile.GFile(val_path, 'rb') as tar_f_obj:
-      tar = tarfile.open(mode='r:', fileobj=tar_f_obj)
-      images = sorted(tar.getnames())
+    images = sorted((name for name in tf.io.gfile.listdir(val_path) if name.lower().endswith('.jpeg')))
     return dict(zip(images, labels))
 
   def _split_generators(self, dl_manager):
-    train_path = os.path.join(dl_manager.manual_dir, 'ILSVRC2012_img_train.tar')
-    val_path = os.path.join(dl_manager.manual_dir, 'ILSVRC2012_img_val.tar')
+    train_path = os.path.join(dl_manager.manual_dir, 'train')
+    val_path = os.path.join(dl_manager.manual_dir, 'val')
     # We don't import the original test split, as it doesn't include labels.
     # These were never publicly released.
     if not tf.io.gfile.exists(train_path) or not tf.io.gfile.exists(val_path):
@@ -156,54 +209,53 @@ class Imagenet2012(tfds.core.GeneratorBasedBuilder):
         tfds.core.SplitGenerator(
             name=tfds.Split.TRAIN,
             gen_kwargs={
-                'archive': dl_manager.iter_archive(train_path),
+                'folder': train_path,
             },
         ),
         tfds.core.SplitGenerator(
             name=tfds.Split.VALIDATION,
             gen_kwargs={
-                'archive': dl_manager.iter_archive(val_path),
+                'folder': val_path,
                 'validation_labels': self._get_validation_labels(val_path),
             },
         ),
     ]
 
   def _fix_image(self, image_fname, image):
-    """Fix image color system and format starting from v 3.0.0."""
-    if self.version < '3.0.0':
-      return image
     if image_fname in CMYK_IMAGES:
       image = io.BytesIO(tfds.core.utils.jpeg_cmyk_to_rgb(image.read()))
     elif image_fname in PNG_IMAGES:
       image = io.BytesIO(tfds.core.utils.png_to_jpeg(image.read()))
     return image
 
-  def _generate_examples(self, archive, validation_labels=None):
+  def _generate_examples(self, folder, validation_labels=None):
     """Yields examples."""
     if validation_labels:  # Validation split
-      for key, example in self._generate_examples_validation(archive,
+      for key, example in self._generate_examples_validation(folder,
                                                              validation_labels):
         yield key, example
+        return
+
     # Training split. Main archive contains archives names after a synset noun.
-    # Each sub-archive contains pictures associated to that synset.
-    for fname, fobj in archive:
-      label = fname[:-4]  # fname is something like 'n01632458.tar'
-      # TODO(b/117643231): in py3, the following lines trigger tarfile module
-      # to call `fobj.seekable()`, which Gfile doesn't have. We should find an
-      # alternative, as this loads ~150MB in RAM.
-      fobj_mem = io.BytesIO(fobj.read())
-      for image_fname, image in tfds.download.iter_archive(
-          fobj_mem, tfds.download.ExtractMethod.TAR_STREAM):
+    # Each subfolder contains pictures associated to that synset, something like 'n01632458'.
+    for fname in tf.io.gfile.listdir(folder):
+      synset_folder = os.path.join(folder, fname)
+      assert tf.io.gfile.isdir(synset_folder)
+      assert re.fullmatch( 'n[0-9]{8}', fname )
+
+      for image_fname in tf.io.gfile.listdir(synset_folder):
+        image = tf.io.gfile.GFile(os.path.join(synset_folder, image_fname), 'rb')
         image = self._fix_image(image_fname, image)
         record = {
             'file_name': image_fname,
             'image': image,
-            'label': label,
+            'label': fname,
         }
         yield image_fname, record
 
-  def _generate_examples_validation(self, archive, labels):
-    for fname, fobj in archive:
+  def _generate_examples_validation(self, folder, labels):
+    for fname in tf.io.gfile.listdir(folder):
+      fobj = tf.io.gfile.GFile(os.path.join(folder, fname), 'rb')
       record = {
           'file_name': fname,
           'image': fobj,
